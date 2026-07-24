@@ -1,0 +1,5 @@
+openai-whisper>=20231117
+PyQt6>=6.5
+scipy>=1.10
+numpy>=1.24
+imageio-ffmpeg>=0.5
