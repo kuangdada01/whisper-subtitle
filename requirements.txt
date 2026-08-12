@@ -1,5 +1,13 @@
-openai-whisper>=20231117
 PyQt6>=6.5
-scipy>=1.10
 numpy>=1.24
+scipy>=1.10
 imageio-ffmpeg>=0.5
+soundfile>=0.14
+funasr>=1.4.1
+modelscope>=1.39
+torch>=2.5
+torchaudio>=2.5
+transformers>=4.50
+accelerate>=1.14
+bitsandbytes>=0.50
+sentencepiece>=0.2

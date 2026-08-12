@@ -20,3 +20,5 @@ dist/
 build/
 .claude/
 视频字幕提取/
+models_cache/
+启动字幕工具.bat

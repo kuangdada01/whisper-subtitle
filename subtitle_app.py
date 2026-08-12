@@ -1,11 +1,11 @@
 import sys
 import os
-import json
-import subprocess
 import imageio_ffmpeg
 
+from subtitle_utils import save_subtitle_files, funasr_result_to_segments
+
 # ===== pythonw.exe 无控制台修复 =====
-# whisper 内部会写 sys.stdout/stderr，pythonw.exe 下它们为 None 导致崩溃
+# 无控制台模式下 sys.stdout/stderr 为 None，库内部写它们会导致崩溃
 if sys.stdout is None:
     sys.stdout = open(os.devnull, "w")
 if sys.stderr is None:
@@ -18,16 +18,10 @@ if os.path.isdir(_qt6_bin):
     os.add_dll_directory(_qt6_bin)
     os.environ["PATH"] = _qt6_bin + os.pathsep + os.environ.get("PATH", "")
 
-# ===== 国内镜像设置 =====
-# HuggingFace 镜像（新版 whisper 内部优先用 HF hub 下载）
-os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-# 如果上面不生效，可尝试备用镜像:
-# os.environ["HF_ENDPOINT"] = "https://hf.xeduapi.com"
-
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QTextEdit, QProgressBar,
-    QComboBox, QMessageBox, QGroupBox
+    QComboBox, QMessageBox, QGroupBox, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont
@@ -42,6 +36,9 @@ BTN_STYLE = """
     QPushButton:hover {
         background-color: #e8e8e8;
     }
+    QPushButton:focus {
+        border: 1px solid black;
+    }
     QPushButton:pressed {
         background-color: #d0d0d0;
     }
@@ -54,32 +51,135 @@ BTN_STYLE_DISABLED = BTN_STYLE + """
 """
 
 
-def _model_dir():
-    """模型存放目录（可写）：EXE 模式下放 exe 旁边，否则放项目目录"""
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+class TranscriptionCancelled(Exception):
+    """Raised when the user asks the worker thread to stop."""
 
 
-def _find_model(model_name):
-    """查找 .pt 模型文件，返回路径或 None
-    优先查可写目录，其次查 EXE 内置目录 (sys._MEIPASS)
+def _run_translate_worker(input_path, target_lang, progress_cb, is_cancelled,
+                          message_cb=None):
+    """在独立进程中运行翻译工作器（隔离 bnb 与 funasr 交替加载的崩溃），返回译文列表
+
+    独立进程每次重新加载翻译模型，与转录进程的 CUDA 状态完全隔离。
+    进度通过工作器 stdout 的 __PROGRESS__ i n 行上报；取消时抛出 TranscriptionCancelled。
+    bnb 在 RTX 50 系显卡上偶发加载崩溃（访问冲突），此处自动重启工作器重试。
     """
-    filename = f"{model_name}.pt"
+    import json
+    import queue
+    import subprocess
+    import tempfile
+    import threading
 
-    # 1) 可写目录（用户下载的、手动放的）
-    writable = os.path.join(_model_dir(), filename)
-    if os.path.exists(writable):
-        return writable
+    script = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "translate_worker.py")
+    max_attempts = 3
+    last_error = None
 
-    # 2) EXE 内置目录（打包时 bundled 的只读模型）
-    meipass = getattr(sys, "_MEIPASS", None)
-    if meipass:
-        bundled = os.path.join(meipass, filename)
-        if os.path.exists(bundled):
-            return bundled
+    for attempt in range(1, max_attempts + 1):
+        fd, out_path = tempfile.mkstemp(suffix=".json", prefix="tr_out_")
+        os.close(fd)
+        proc = subprocess.Popen(
+            [sys.executable, script, input_path, target_lang, out_path],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            encoding="utf-8", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        q = queue.Queue()
+        lines_tail = []
 
-    return None
+        def reader():
+            try:
+                for line in proc.stdout:
+                    q.put(line)
+            except Exception:
+                pass
+
+        threading.Thread(target=reader, daemon=True).start()
+
+        def handle(line):
+            nonlocal lines_tail
+            line = line.strip()
+            if line:
+                lines_tail.append(line)
+                lines_tail = lines_tail[-20:]
+            if line.startswith("__PROGRESS__ "):
+                try:
+                    _, i, n = line.split()
+                    progress_cb(int(i), int(n))
+                except ValueError:
+                    pass
+
+        try:
+            while proc.poll() is None:
+                if is_cancelled():
+                    proc.kill()
+                    raise TranscriptionCancelled()
+                try:
+                    handle(q.get(timeout=0.5))
+                except queue.Empty:
+                    continue
+            while True:
+                try:
+                    handle(q.get(timeout=0.5))
+                except queue.Empty:
+                    break
+            if proc.returncode != 0:
+                detail = "\n".join(lines_tail[-10:])
+                last_error = RuntimeError(
+                    f"翻译进程异常退出（代码 {proc.returncode}）\n{detail}")
+            elif not os.path.exists(out_path):
+                last_error = RuntimeError("翻译进程未生成结果文件")
+            else:
+                with open(out_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+
+        if attempt < max_attempts:
+            if message_cb:
+                message_cb(
+                    f"翻译进程异常，正在自动重试（{attempt}/{max_attempts - 1}）…",
+                    93)
+        else:
+            raise last_error
+
+
+def _cuda_available():
+    """后台检查 CUDA 是否可用（避免在 UI 线程 import torch）"""
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+def _ensure_ffmpeg_on_path():
+    """确保 ffmpeg 能通过 PATH 找到。"""
+    import subprocess
+    import shutil
+
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    ffmpeg_dir = os.path.dirname(ffmpeg_exe)
+
+    # imageio-ffmpeg 的可能不是 ffmpeg.exe，需要确保标准名字可用
+    ffmpeg_name = "ffmpeg.exe"
+    ffmpeg_standard = os.path.join(ffmpeg_dir, ffmpeg_name)
+    if not os.path.isfile(ffmpeg_standard):
+        try:
+            shutil.copy2(ffmpeg_exe, ffmpeg_standard)
+        except Exception:
+            pass
+
+    if ffmpeg_dir and os.path.isdir(ffmpeg_dir):
+        path_parts = os.environ.get("PATH", "").split(os.pathsep)
+        if ffmpeg_dir not in path_parts:
+            os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+
+    return ffmpeg_exe
 
 
 class TranscribeThread(QThread):
@@ -87,178 +187,221 @@ class TranscribeThread(QThread):
     progress = pyqtSignal(str, int)  # (消息, 百分比)
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, input_file, output_dir, model_size, language):
+    def __init__(self, input_file, output_dir, language, funasr_cached=None, target_lang=None):
         super().__init__()
         self.input_file = input_file
         self.output_dir = output_dir
-        self.model_size = model_size
         self.language = language
+        self.target_lang = target_lang  # 翻译目标语言；None 表示不翻译
+        # FunASR 缓存的 {lang: {"asr":.., "vad":.., "punc":..}} 模型；None 表示本线程内加载
+        self.funasr_cached = funasr_cached
+        self.funasr_models = None
 
-    def _load_whisper_model(self, whisper):
-        """加载 Whisper 模型：本地 .pt > 国内镜像下载 > whisper 默认"""
+    def _check_cancelled(self):
+        if self.isInterruptionRequested():
+            raise TranscriptionCancelled()
 
-        # 1) 本地 .pt 文件 — 直接加载
-        local_pt = _find_model(self.model_size)
-        if local_pt:
-            self.progress.emit(f"从本地加载模型: {local_pt}", 35)
-            return whisper.load_model(local_pt)
+    def _run_funasr(self, cached_models):
+        """FunASR 引擎：ffmpeg 提取 16k WAV -> 按语言选模型 -> 切行/分段 -> 补标点
+        - 中文:  paraformer-zh(带 VAD+逐字时间戳) + ct-punc
+        - 英/日/韩/粤: fsmn-vad 分段 + SenseVoiceSmall(多语种、自带标点)
+        """
+        import subprocess
 
-        # 2) 从国内镜像下载 .pt 到本地
-        self.progress.emit(f"正在下载模型 {self.model_size}（国内镜像）...", 35)
-        model_path = self._download_from_mirror()
-        if model_path and os.path.exists(model_path):
-            return whisper.load_model(model_path)
-
-        # 3) 兜底：whisper 默认下载（HF_ENDPOINT 已指向国内镜像）
-        self.progress.emit(f"正在下载模型 {self.model_size}（HF 镜像）...", 35)
-        return whisper.load_model(self.model_size)
-
-    def _download_from_mirror(self):
-        """从国内镜像下载 Whisper .pt 模型文件"""
-        import urllib.request
-
-        dest = os.path.join(_model_dir(), f"{self.model_size}.pt")
-
-        # GitHub Release 文件名（v20231117 是最后一个 release）
-        pt_files = {
-            "tiny":   "tiny.pt",
-            "base":   "base.pt",
-            "small":  "small.pt",
-            "medium": "medium.pt",
-            "large":  "large-v3.pt",
-        }
-        filename = pt_files.get(self.model_size)
-        if not filename:
-            return None
-
-        # GitHub Release CDN 代理（国内可访问）
-        mirrors = [
-            f"https://mirror.ghproxy.com/https://github.com/openai/whisper/releases/download/v20231117/{filename}",
-            f"https://ghproxy.net/https://github.com/openai/whisper/releases/download/v20231117/{filename}",
-            f"https://gh-proxy.com/https://github.com/openai/whisper/releases/download/v20231117/{filename}",
+        self.progress.emit("正在提取音频...", 10)
+        audio_path = os.path.join(self.output_dir, "temp_audio.wav")
+        ffmpeg_exe = _ensure_ffmpeg_on_path()
+        cmd = [
+            ffmpeg_exe, "-i", self.input_file,
+            "-vn", "-acodec", "pcm_s16le",
+            "-ar", "16000", "-ac", "1",
+            "-y", audio_path,
         ]
+        subprocess.run(cmd, capture_output=True, check=True)
+        self._check_cancelled()
 
-        for url in mirrors:
+        from funasr import AutoModel
+        from subtitle_utils import funasr_result_to_segments, clean_funasr_text
+
+        device = "cuda:0" if _cuda_available() else "cpu"
+        lang = self.language or "zh"  # 'zh' | 'en' | 'ja' | 'ko' | 'yue'
+
+        # cached_models: {lang: {"asr":..., "vad":..., "punc":...}}
+        if cached_models is None:
+            cached_models = {}
+        models = cached_models.get(lang)
+        if models is None:
+            self.progress.emit("正在加载 FunASR 模型...", 30)
+            if lang == "zh":
+                asr = AutoModel(model="paraformer-zh", vad_model="fsmn-vad",
+                                disable_update=True, device=device)
+                punc = AutoModel(model="ct-punc", disable_update=True, device=device)
+                vad = None
+            else:
+                vad = AutoModel(model="fsmn-vad", disable_update=True, device=device)
+                asr = AutoModel(model="iic/SenseVoiceSmall",
+                                disable_update=True, device=device)
+                punc = None
+            models = {"asr": asr, "vad": vad, "punc": punc}
+            self._check_cancelled()
+        cached_models[lang] = models
+        self.funasr_models = cached_models
+
+        asr, vad, punc = models["asr"], models["vad"], models["punc"]
+
+        self.progress.emit("正在转录...", 50)
+        if vad is None:
+            # 中文：逐字时间戳，按停顿/字数切行
+            res = asr.generate(input=audio_path, batch_size_s=300)
+            self._check_cancelled()
+            self.progress.emit("正在生成字幕...", 90)
+            segments = funasr_result_to_segments(res, punc)
+        else:
+            # 英/日/韩/粤：VAD 分段得到每段起止，逐段转录
+            import soundfile as sf
+
+            vad_res = vad.generate(input=audio_path, max_single_segment_time=60000)
+            self._check_cancelled()
+            vad_segs = vad_res[0]["value"] if vad_res else []
+            if not vad_segs:
+                raise RuntimeError("未检测到语音内容")
+
+            audio, sr = sf.read(audio_path, dtype="float32")
+            clips = [audio[int(s * sr / 1000):int(e * sr / 1000)] for s, e in vad_segs]
+
+            res = asr.generate(input=clips, language=lang, use_itn=True,
+                               batch_size_s=300)
+            self._check_cancelled()
+
+            self.progress.emit("正在生成字幕...", 90)
+            segments = []
+            for (s_ms, e_ms), item in zip(vad_segs, res):
+                text = clean_funasr_text(item.get("text", ""))
+                if text:
+                    segments.append({
+                        "start": round(s_ms / 1000.0, 3),
+                        "end": round(e_ms / 1000.0, 3),
+                        "text": text,
+                    })
+
+        if os.path.exists(audio_path):
             try:
-                self.progress.emit(f"下载: {url[:60]}...", 35)
-                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    total = int(resp.headers.get("Content-Length", 0))
-                    data = bytearray()
-                    downloaded = 0
-                    while True:
-                        chunk = resp.read(8192)
-                        if not chunk:
-                            break
-                        data.extend(chunk)
-                        downloaded += len(chunk)
-                        if total > 0:
-                            pct = 35 + int(downloaded / total * 10)
-                            self.progress.emit(
-                                f"下载 {filename}: {downloaded//1024//1024}MB / {total//1024//1024}MB", pct
-                            )
-                with open(dest, "wb") as f:
-                    f.write(data)
-                self.progress.emit(f"模型下载完成: {dest}", 45)
-                return dest
-            except Exception as e:
-                self.progress.emit(f"镜像失败: {e}", 35)
-                continue
+                os.remove(audio_path)
+            except OSError:
+                pass
 
-        return None
+        if not segments:
+            raise RuntimeError("未识别到语音内容")
+
+        base_name = os.path.splitext(os.path.basename(self.input_file))[0]
+        base_path = os.path.join(self.output_dir, base_name)
+        srt_path = save_subtitle_files(base_path, segments)
+        self.progress.emit(f"转录完成！共 {len(segments)} 个片段", 90)
+
+        if not self.target_lang:
+            self.progress.emit(f"转录完成！共 {len(segments)} 个片段", 100)
+            self.finished.emit(True, srt_path)
+            return
+
+        # 翻译：先释放 FunASR 模型显存，再在独立进程中加载翻译模型
+        self.progress.emit("正在准备翻译...", 92)
+        cached_models.clear()
+        self.funasr_models = None
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+        from subtitle_utils import save_translated_srt
+
+        self.progress.emit("正在加载翻译模型（首次约 1 分钟）...", 93)
+        import json
+        import tempfile
+        fd, in_path = tempfile.mkstemp(suffix=".json", prefix="tr_in_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump([{"text": s["text"]} for s in segments], f, ensure_ascii=False)
+            translated = _run_translate_worker(
+                in_path, self.target_lang,
+                lambda i, n: self.progress.emit(
+                    f"正在翻译 {i}/{n}...", 93 + int(i / n * 6)),
+                self.isInterruptionRequested,
+                lambda m, p: self.progress.emit(m, p),
+            )
+        finally:
+            try:
+                os.remove(in_path)
+            except OSError:
+                pass
+        self._check_cancelled()
+        for seg, t in zip(segments, translated):
+            seg["translated_text"] = t
+        srt_path = save_translated_srt(base_path, segments, self.target_lang)
+        self.progress.emit(f"转录+翻译完成！共 {len(segments)} 段", 100)
+        self.finished.emit(True, srt_path)
 
     def run(self):
         try:
-            self.progress.emit("正在提取音频...", 10)
-
-            # 提取音频
-            audio_path = os.path.join(self.output_dir, "temp_audio.wav")
-            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-            cmd = [
-                ffmpeg_exe, "-i", self.input_file,
-                "-vn", "-acodec", "pcm_s16le",
-                "-ar", "16000", "-ac", "1",
-                "-y", audio_path
-            ]
-            subprocess.run(cmd, capture_output=True, check=True)
-
-            self.progress.emit("正在加载模型...", 30)
-            import whisper
-            import numpy as np
-            from scipy.io import wavfile
-
-            # --- 加载模型（含国内镜像逻辑）---
-            model = self._load_whisper_model(whisper)
-
-            self.progress.emit("正在转录...", 50)
-            sample_rate, audio_data = wavfile.read(audio_path)
-            if audio_data.ndim > 1:
-                audio_data = audio_data.mean(axis=1)
-            audio = audio_data.astype(np.float32) / 32768.0
-
-            # language为None时自动检测语言
-            if self.language:
-                result = model.transcribe(audio, language=self.language, verbose=False)
-            else:
-                result = model.transcribe(audio, verbose=False)
-
-            self.progress.emit("正在生成字幕...", 90)
-            # 生成 SRT
-            srt_lines = []
-            for i, seg in enumerate(result["segments"], 1):
-                start = seg["start"]
-                end = seg["end"]
-                text = seg["text"].strip()
-
-                sh = int(start // 3600)
-                sm = int((start % 3600) // 60)
-                ss = start % 60
-                eh = int(end // 3600)
-                em = int((end % 3600) // 60)
-                es = end % 60
-
-                srt_lines.append(str(i))
-                srt_lines.append(
-                    "{:02d}:{:02d}:{:06.3f}".format(sh, sm, ss).replace(".", ",")
-                    + " --> "
-                    + "{:02d}:{:02d}:{:06.3f}".format(eh, em, es).replace(".", ",")
-                )
-                srt_lines.append(text)
-                srt_lines.append("")
-
-            # 保存文件
-            base_name = os.path.splitext(os.path.basename(self.input_file))[0]
-            srt_path = os.path.join(self.output_dir, f"{base_name}.srt")
-            json_path = os.path.join(self.output_dir, f"{base_name}.json")
-
-            with open(srt_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(srt_lines))
-
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(result["segments"], f, ensure_ascii=False, indent=2)
-
-            # 清理临时文件
-            if os.path.exists(audio_path):
-                os.remove(audio_path)
-
-            self.progress.emit(f"转录完成！共 {len(result['segments'])} 个片段", 100)
-            self.finished.emit(True, srt_path)
-
+            self._run_funasr(self.funasr_cached)
+        except TranscriptionCancelled:
+            self.finished.emit(False, "已取消")
         except Exception as e:
             self.finished.emit(False, str(e))
 
-        finally:
-            # 释放显存
-            try:
-                import torch
-                if 'model' in locals():
-                    del model
-                if 'result' in locals():
-                    del result
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
+
+class TranslateThread(QThread):
+    """翻译现有字幕文件线程"""
+    progress = pyqtSignal(str, int)  # (消息, 百分比)
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, file_path, target_lang):
+        super().__init__()
+        self.file_path = file_path
+        self.target_lang = target_lang
+
+    def run(self):
+        try:
+            from subtitle_utils import load_segments, save_translated_srt
+
+            self.progress.emit("正在读取字幕...", 5)
+            segments = load_segments(self.file_path)
+            if not segments:
+                raise RuntimeError("字幕文件为空或格式无法解析")
+
+            self.progress.emit("正在加载翻译模型（首次约 1 分钟）...", 10)
+            translated = _run_translate_worker(
+                self.file_path, self.target_lang,
+                lambda i, n: self.progress.emit(
+                    f"正在翻译 {i}/{n}...", 10 + int(i / n * 85)),
+                self.isInterruptionRequested,
+                lambda m, p: self.progress.emit(m, p),
+            )
+            if self.isInterruptionRequested():
+                raise TranscriptionCancelled()
+            for seg, t in zip(segments, translated):
+                seg["translated_text"] = t
+            base = os.path.splitext(self.file_path)[0]
+            srt_path = save_translated_srt(base, segments, self.target_lang)
+            self.progress.emit("翻译完成！", 100)
+            self.finished.emit(True, srt_path)
+        except TranscriptionCancelled:
+            self.finished.emit(False, "已取消")
+        except Exception as e:
+            self.finished.emit(False, str(e))
+
+
+class DeviceCheckThread(QThread):
+    """后台检测 GPU / CPU（torch import 较慢，不阻塞窗口显示）"""
+    result = pyqtSignal(str)  # "GPU (CUDA)" 或 "CPU"
+
+    def run(self):
+        try:
+            import torch
+            device = "GPU (CUDA)" if torch.cuda.is_available() else "CPU"
+        except Exception:
+            device = "CPU"
+        self.result.emit(device)
 
 
 class SubtitleApp(QMainWindow):
@@ -272,6 +415,14 @@ class SubtitleApp(QMainWindow):
         self.progress_timer = QTimer()
         self.progress_timer.timeout.connect(self.update_progress)
         self.current_progress = 0
+        self.close_after_cancel = False
+
+        # 模型缓存：按语言缓存 FunASR 模型 {lang: {"asr":.., "vad":.., "punc":..}}
+        self._funasr_models = None
+
+        # 异步检测 GPU / CPU
+        self.device_thread = None
+        self._start_device_check()
 
     def init_ui(self):
         central_widget = QWidget()
@@ -293,67 +444,30 @@ class SubtitleApp(QMainWindow):
         file_layout.addWidget(self.select_btn)
         input_layout.addLayout(file_layout)
 
-        # 模型选择（自动检测本地/云端）
-        model_layout = QHBoxLayout()
-        model_layout.addWidget(QLabel("模型大小:"))
-        self.model_combo = QComboBox()
-
-        # 扫描本地 .pt 文件（可写目录 + EXE 内置）
-        local_models = set()
-        for name in ["tiny", "base", "small", "medium", "large"]:
-            if _find_model(name):
-                local_models.add(name)
-
-        # 构建下拉项：本地模型标注"本地"，其余标注"云端"
-        self.model_items = []  # 保存 (显示文本, model_size)
-        for name in ["tiny", "base", "small", "medium", "large"]:
-            if name in local_models:
-                label = f"{name}（本地）"
-            else:
-                label = f"{name}（云端）"
-            self.model_items.append((label, name))
-            self.model_combo.addItem(label)
-
-        # 默认选中本地已有的最大模型，否则选 medium
-        for m in ["large", "medium", "base", "small", "tiny"]:
-            if m in local_models:
-                self.model_combo.setCurrentText(f"{m}（本地）")
-                break
-        else:
-            self.model_combo.setCurrentText("medium（云端）")
-        model_layout.addWidget(self.model_combo)
-
-        # GPU / CPU 状态
-        try:
-            import torch
-            device = "GPU (CUDA)" if torch.cuda.is_available() else "CPU"
-            device_color = "#0070CB" if torch.cuda.is_available() else "#888"
-        except Exception:
-            device = "CPU"
-            device_color = "#888"
-        self.device_label = QLabel(device)
-        self.device_label.setStyleSheet(
-            f"color: {device_color}; font-weight: bold; padding: 2px 6px;"
-        )
-        model_layout.addWidget(self.device_label)
-
-        model_layout.addWidget(QLabel("字幕语言:"))
+        # 字幕语言 + 翻译目标语言（一行）
+        lang_layout = QHBoxLayout()
+        lang_layout.addWidget(QLabel("字幕语言:"))
         self.lang_combo = QComboBox()
         self.lang_combo.addItems([
             "自动检测",
-            "中文 (zh)", "英文 (en)", "日文 (ja)", "韩文 (ko)",
-            "法文 (fr)", "德文 (de)", "西班牙文 (es)", "俄文 (ru)",
-            "阿拉伯文 (ar)", "葡萄牙文 (pt)", "意大利文 (it)",
-            "荷兰文 (nl)", "波兰文 (pl)", "土耳其文 (tr)",
-            "瑞典文 (sv)", "丹麦文 (da)", "芬兰文 (fi)",
-            "挪威文 (no)", "匈牙利文 (hu)", "捷克文 (cs)",
-            "希腊文 (el)", "希伯来文 (he)", "泰文 (th)",
-            "越南文 (vi)", "印尼文 (id)", "马来文 (ms)"
+            "中文 (zh)", "英文 (en)", "日文 (ja)", "韩文 (ko)", "粤语 (yue)",
         ])
         self.lang_combo.setCurrentText("自动检测")
-        model_layout.addWidget(self.lang_combo)
-        model_layout.addStretch()
-        input_layout.addLayout(model_layout)
+        lang_layout.addWidget(self.lang_combo)
+
+        lang_layout.addWidget(QLabel("翻译目标语言:"))
+        self.translate_combo = QComboBox()
+        self.translate_combo.addItems(["不翻译", "中文 (zh)", "英文 (en)", "日文 (ja)", "韩文 (ko)"])
+        lang_layout.addWidget(self.translate_combo)
+
+        # GPU / CPU 状态（异步检测，避免启动时卡在 torch import）
+        self.device_label = QLabel("检测中...")
+        self.device_label.setStyleSheet(
+            "color: #888; font-weight: bold; padding: 2px 6px;"
+        )
+        lang_layout.addWidget(self.device_label)
+        lang_layout.addStretch()
+        input_layout.addLayout(lang_layout)
 
         input_group.setLayout(input_layout)
         layout.addWidget(input_group)
@@ -372,7 +486,11 @@ class SubtitleApp(QMainWindow):
         status_layout = QHBoxLayout()
         status_layout.setContentsMargins(2, 0, 1, 0)
         self.status_label = QLabel("就绪")
+        # 允许标签收缩，长消息不撑开窗口
+        self.status_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.progress_bar = QProgressBar()
+        self.progress_bar.setFixedHeight(18)
+        self.progress_bar.setFixedWidth(200)
         self.progress_bar.setTextVisible(True)
         self.progress_bar.setFormat("%p%")
         self.progress_bar.setStyleSheet("""
@@ -389,8 +507,8 @@ class SubtitleApp(QMainWindow):
         """)
         self.progress_bar.hide()
 
-        status_layout.addWidget(self.status_label)
-        status_layout.addWidget(self.progress_bar, 1)
+        status_layout.addWidget(self.status_label, 1)
+        status_layout.addWidget(self.progress_bar)
         layout.addLayout(status_layout)
 
         # 按钮组
@@ -409,6 +527,10 @@ class SubtitleApp(QMainWindow):
         self.open_folder_btn.setEnabled(False)
         self.open_folder_btn.setStyleSheet(BTN_STYLE_DISABLED)
 
+        self.translate_btn = QPushButton("翻译现有字幕")
+        self.translate_btn.clicked.connect(self.translate_existing)
+        self.translate_btn.setStyleSheet(BTN_STYLE)
+
         self.exit_btn = QPushButton("退出")
         self.exit_btn.clicked.connect(self.close)
         self.exit_btn.setStyleSheet(BTN_STYLE)
@@ -416,6 +538,7 @@ class SubtitleApp(QMainWindow):
         btn_layout.addWidget(self.start_btn)
         btn_layout.addWidget(self.reselect_btn)
         btn_layout.addWidget(self.open_folder_btn)
+        btn_layout.addWidget(self.translate_btn)
         btn_layout.addWidget(self.exit_btn)
 
         btn_group = QGroupBox("操作")
@@ -437,14 +560,52 @@ class SubtitleApp(QMainWindow):
             self.start_btn.setEnabled(True)
             self.status_label.setText("文件已选择，可以开始转录")
 
+    def _start_device_check(self):
+        def _on_done():
+            self.device_thread = None
+
+        self.device_thread = DeviceCheckThread()
+        self.device_thread.result.connect(self._apply_device)
+        self.device_thread.finished.connect(_on_done)
+        self.device_thread.start()
+
+    def _apply_device(self, device):
+        color = "#0070CB" if device == "GPU (CUDA)" else "#888"
+        self.device_label.setText(device)
+        self.device_label.setStyleSheet(
+            f"color: {color}; font-weight: bold; padding: 2px 6px;"
+        )
+
     def open_output_folder(self):
         if self.output_dir and os.path.isdir(self.output_dir):
             os.startfile(self.output_dir)
 
     def closeEvent(self, event):
         if hasattr(self, "thread") and self.thread is not None and self.thread.isRunning():
-            self.thread.terminate()
-            self.thread.wait(3000)
+            if self.close_after_cancel:
+                event.ignore()
+                return
+            reply = QMessageBox.question(
+                self,
+                "正在转录",
+                "转录仍在进行。要取消任务并在当前阶段结束后退出吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.close_after_cancel = True
+                self.thread.requestInterruption()
+                self.status_label.setText("正在取消，等待当前阶段结束...")
+                self.output_text.append("\n正在取消，等待当前阶段结束...")
+                self.start_btn.setEnabled(False)
+                self.select_btn.setEnabled(False)
+                self.reselect_btn.setEnabled(False)
+                self.translate_btn.setEnabled(False)
+            event.ignore()
+            return
+        # 等待后台 GPU 检测线程结束（最长 5 秒），避免销毁运行中的线程
+        if self.device_thread is not None and self.device_thread.isRunning():
+            self.device_thread.wait(5000)
         event.accept()
 
     def reselect(self):
@@ -457,14 +618,45 @@ class SubtitleApp(QMainWindow):
         self.status_label.setText("就绪")
         self.progress_bar.hide()
 
+    def _target_lang(self):
+        """从翻译下拉框取语言代码；"不翻译" 返回 None"""
+        text = self.translate_combo.currentText()
+        if text == "不翻译":
+            return None
+        return text.split("(")[1].rstrip(")")
+
+    def translate_existing(self):
+        """翻译已有的 .srt / .json 字幕文件"""
+        target_lang = self._target_lang()
+        if not target_lang:
+            QMessageBox.warning(self, "提示", '请先在"翻译目标语言"中选择目标语言')
+            return
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择字幕文件", "", "字幕文件 (*.srt *.json);;所有文件 (*)"
+        )
+        if not file_path:
+            return
+
+        self.start_btn.setEnabled(False)
+        self.select_btn.setEnabled(False)
+        self.reselect_btn.setEnabled(False)
+        self.translate_btn.setEnabled(False)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.show()
+        self.output_text.clear()
+
+        self.thread = TranslateThread(file_path, target_lang)
+        self.thread.progress.connect(self.on_progress)
+        self.thread.finished.connect(self.on_finished)
+        self.thread.start()
+
     def start_transcribe(self):
         if not self.input_file:
             return
 
         # 获取输出目录（与输入文件同目录）
         self.output_dir = os.path.dirname(self.input_file)
-        # 从下拉框提取模型名（去除 "（本地）" / "（云端下载）" 后缀）
-        model_size = self.model_combo.currentText().split("（")[0]
         # 从下拉框提取语言代码，如 "中文 (zh)" -> "zh"，"自动检测" -> None
         lang_text = self.lang_combo.currentText()
         if lang_text == "自动检测":
@@ -472,17 +664,32 @@ class SubtitleApp(QMainWindow):
         else:
             language = lang_text.split("(")[1].rstrip(")")
 
+        # 自动检测/中文走 paraformer-zh（逐字时间戳），其余走 SenseVoice
+        funasr_lang_map = {None: "zh", "zh": "zh", "en": "en", "ja": "ja", "ko": "ko", "yue": "yue"}
+        language = funasr_lang_map.get(language, "zh")
+
+        target_lang = self._target_lang()
+
         # 禁用按钮
         self.start_btn.setEnabled(False)
         self.select_btn.setEnabled(False)
         self.reselect_btn.setEnabled(False)
+        self.translate_btn.setEnabled(False)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.show()
         self.output_text.clear()
 
+        # 需要翻译时丢弃 FunASR 缓存，转录后释放显存给翻译模型
+        funasr_cached = self._funasr_models
+        if target_lang and funasr_cached:
+            self._funasr_models = None
+            funasr_cached = None
+
         # 启动转录线程
-        self.thread = TranscribeThread(self.input_file, self.output_dir, model_size, language)
+        self.thread = TranscribeThread(
+            self.input_file, self.output_dir, language, funasr_cached, target_lang,
+        )
         self.thread.progress.connect(self.on_progress)
         self.thread.finished.connect(self.on_finished)
         self.thread.start()
@@ -514,6 +721,10 @@ class SubtitleApp(QMainWindow):
         self.start_btn.setEnabled(True)
         self.select_btn.setEnabled(True)
         self.reselect_btn.setEnabled(True)
+        self.translate_btn.setEnabled(True)
+
+        # 回存模型供下次转录复用（加载失败则为 None，下次重新加载）
+        self._funasr_models = getattr(self.thread, "funasr_models", None)
 
         if success:
             self.open_folder_btn.setEnabled(True)
@@ -526,14 +737,22 @@ class SubtitleApp(QMainWindow):
                     content = f.read()
                 self.output_text.append("\n=== 字幕内容 ===\n")
                 self.output_text.append(content)
-            except:
+            except Exception:
                 pass
 
             QMessageBox.information(self, "完成", f"字幕已生成！\n{message}")
+        elif message == "已取消":
+            self.status_label.setText("已取消")
+            self.output_text.append("\n任务已取消")
         else:
             self.status_label.setText(f"错误: {message}")
             self.output_text.append(f"\n错误: {message}")
             QMessageBox.critical(self, "错误", f"转录失败:\n{message}")
+
+        if self.close_after_cancel:
+            self.thread = None
+            self.close_after_cancel = False
+            QTimer.singleShot(0, self.close)
 
 
 def main():

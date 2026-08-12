@@ -1,79 +1,145 @@
+"""FunASR 命令行转录：读取同目录 temp_audio.wav（16k 单声道），生成 SRT 字幕"""
+
+import argparse
 import os
 import sys
-import json
-import numpy as np
 
-# ===== 国内镜像设置 =====
-os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+# ===== pythonw.exe 无控制台修复 =====
+# 无控制台模式下 sys.stdout/stderr 为 None，库内部写它们会导致崩溃
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
 
-import whisper
-from scipy.io import wavfile
+# 必须先于 funasr 导入 subtitle_utils（它会设置 HF 缓存环境变量）
+import subtitle_utils
+from subtitle_utils import save_subtitle_files, funasr_result_to_segments, clean_funasr_text
+
+from funasr import AutoModel
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-print("Loading audio...")
-audio_file = os.path.join(SCRIPT_DIR, "temp_audio.wav")
-sample_rate, audio_data = wavfile.read(audio_file)
-# Convert to float32 mono
-if audio_data.ndim > 1:
-    audio_data = audio_data.mean(axis=1)
-audio = audio_data.astype(np.float32) / 32768.0
-print(f"Audio loaded: {len(audio)/sample_rate:.1f}s, {sample_rate}Hz")
 
-print("Loading whisper model (medium for better Chinese accuracy)...")
-model_path = os.path.join(SCRIPT_DIR, "medium.pt")
-model = whisper.load_model(model_path)
-print("Model loaded. Transcribing...")
+def transcribe(audio_path, lang, device):
+    """转录音频，lang: zh | en | ja | ko | yue
+    - 中文: paraformer-zh(带 VAD+逐字时间戳) + ct-punc
+    - 英/日/韩/粤: fsmn-vad 分段 + SenseVoiceSmall(多语种、自带标点)
+    返回: [{'start': s, 'end': e, 'text': t}, ...]
+    """
+    if lang == "zh":
+        asr = AutoModel(model="paraformer-zh", vad_model="fsmn-vad",
+                        disable_update=True, device=device)
+        punc = AutoModel(model="ct-punc", disable_update=True, device=device)
+        res = asr.generate(input=audio_path, batch_size_s=300)
+        segments = funasr_result_to_segments(res, punc)
+    else:
+        import soundfile as sf
 
-result = model.transcribe(
-    audio,
-    language="zh",
-    verbose=False
-)
+        vad = AutoModel(model="fsmn-vad", disable_update=True, device=device)
+        asr = AutoModel(model="iic/SenseVoiceSmall",
+                        disable_update=True, device=device)
+        vad_res = vad.generate(input=audio_path, max_single_segment_time=60000)
+        vad_segs = vad_res[0]["value"] if vad_res else []
+        if not vad_segs:
+            raise RuntimeError("未检测到语音内容")
 
-print("Transcription complete.")
-print(f"Total segments: {len(result['segments'])}")
+        audio, sr = sf.read(audio_path, dtype="float32")
+        clips = [audio[int(s * sr / 1000):int(e * sr / 1000)] for s, e in vad_segs]
 
-# Save SRT
-srt_lines = []
-for i, seg in enumerate(result["segments"], 1):
-    start = seg["start"]
-    end = seg["end"]
-    text = seg["text"].strip()
+        res = asr.generate(input=clips, language=lang, use_itn=True, batch_size_s=300)
+        segments = []
+        for (s_ms, e_ms), item in zip(vad_segs, res):
+            text = clean_funasr_text(item.get("text", ""))
+            if text:
+                segments.append({
+                    "start": round(s_ms / 1000.0, 3),
+                    "end": round(e_ms / 1000.0, 3),
+                    "text": text,
+                })
 
-    sh = int(start // 3600)
-    sm = int((start % 3600) // 60)
-    ss = start % 60
-    eh = int(end // 3600)
-    em = int((end % 3600) // 60)
-    es = end % 60
+    if not segments:
+        raise RuntimeError("未识别到语音内容")
+    return segments
 
-    srt_lines.append(str(i))
-    srt_lines.append(
-        "{:02d}:{:02d}:{:06.3f}".format(sh, sm, ss).replace(".", ",")
-        + " --> "
-        + "{:02d}:{:02d}:{:06.3f}".format(eh, em, es).replace(".", ",")
-    )
-    srt_lines.append(text)
-    srt_lines.append("")
 
-srt_path = os.path.join(SCRIPT_DIR, "subtitles.srt")
-with open(srt_path, "w", encoding="utf-8") as f:
-    f.write("\n".join(srt_lines))
+def main():
+    parser = argparse.ArgumentParser(description="FunASR 转录 temp_audio.wav 生成字幕")
+    parser.add_argument("--lang", default="zh",
+                        choices=["zh", "en", "ja", "ko", "yue"],
+                        help="语言（默认 zh）")
+    parser.add_argument("--translate", default=None,
+                        choices=["zh", "en", "ja", "ko"],
+                        help="转录后用 LLM 翻译为目标语言")
+    args = parser.parse_args()
 
-# Save JSON
-json_path = os.path.join(SCRIPT_DIR, "subtitles.json")
-with open(json_path, "w", encoding="utf-8") as f:
-    json.dump(result["segments"], f, ensure_ascii=False, indent=2)
+    audio_file = os.path.join(SCRIPT_DIR, "temp_audio.wav")
+    if not os.path.exists(audio_file):
+        print(f"未找到音频文件: {audio_file}")
+        sys.exit(1)
 
-print("SRT saved to: " + srt_path)
-print("JSON saved to: " + json_path)
-print("")
-print("=== 字幕内容 ===")
-for seg in result["segments"]:
-    start = seg["start"]
-    end = seg["end"]
-    text = seg["text"].strip()
-    m1, s1 = divmod(start, 60)
-    m2, s2 = divmod(end, 60)
-    print("[{:02d}:{:05.2f} -> {:02d}:{:05.2f}] {}".format(int(m1), s1, int(m2), s2, text))
+    try:
+        import torch
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        device = "cpu"
+    print(f"设备: {device}, 语言: {args.lang}")
+
+    print("加载 FunASR 模型...")
+    segments = transcribe(audio_file, args.lang, device)
+    print(f"转录完成，共 {len(segments)} 个片段")
+
+    # 保存 SRT
+    srt_path = save_subtitle_files(os.path.join(SCRIPT_DIR, "subtitles"), segments)
+
+    if args.translate:
+        import json
+        import subprocess
+        import tempfile
+        print(f"正在用 LLM 翻译为 {args.translate}...")
+        fd, in_path = tempfile.mkstemp(suffix=".json", prefix="tr_in_")
+        fd2, out_path = tempfile.mkstemp(suffix=".json", prefix="tr_out_")
+        os.close(fd)
+        os.close(fd2)
+        try:
+            with open(in_path, "w", encoding="utf-8") as f:
+                json.dump([{"text": s["text"]} for s in segments], f,
+                          ensure_ascii=False)
+            proc = subprocess.run(
+                [sys.executable, os.path.join(SCRIPT_DIR, "translate_worker.py"),
+                 in_path, args.translate, out_path],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(f"翻译进程异常退出（代码 {proc.returncode}）")
+            with open(out_path, "r", encoding="utf-8") as f:
+                translated = json.load(f)
+        finally:
+            for p in (in_path, out_path):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        for seg, t in zip(segments, translated):
+            seg["translated_text"] = t
+        from subtitle_utils import save_translated_srt
+        srt_path = save_translated_srt(
+            os.path.join(SCRIPT_DIR, "subtitles"), segments, args.translate)
+        print(f"翻译字幕已保存: {srt_path}")
+
+    print("SRT saved to: " + srt_path)
+    print("")
+    print("=== 字幕内容 ===")
+    for seg in segments:
+        start = seg["start"]
+        end = seg["end"]
+        text = seg.get("translated_text") or seg["text"]
+        text = text.strip()
+        m1, s1 = divmod(start, 60)
+        m2, s2 = divmod(end, 60)
+        print("[{:02d}:{:05.2f} -> {:02d}:{:05.2f}] {}".format(int(m1), s1, int(m2), s2, text))
+
+
+if __name__ == "__main__":
+    main()
